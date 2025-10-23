@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# Tests
+test_api.py
+
+# Documentation
+README.md
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+logs/
