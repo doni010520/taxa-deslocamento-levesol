@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  taxa-deslocamento:
+    build: .
+    ports:
+      - "7777:7777"
+    environment:
+      - PORT=7777
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
