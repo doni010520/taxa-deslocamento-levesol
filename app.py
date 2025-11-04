@@ -162,6 +162,82 @@ def obter_coordenadas_viacep(cep: str) -> dict:
         logger.error(f"Erro ao obter coordenadas: {e}")
         raise
 
+def obter_coordenadas_por_endereco(endereco_completo: str) -> dict:
+    """
+    Obtém coordenadas diretamente do endereço usando Nominatim
+    Aceita endereço em formato livre
+    """
+    # Verificar cache (usando endereço como chave)
+    cache_key = f"endereco_{endereco_completo.lower().strip()}"
+    if cache_key in CACHE_COORDENADAS:
+        logger.info(f"Endereço '{endereco_completo}' encontrado no cache")
+        return CACHE_COORDENADAS[cache_key]
+    
+    try:
+        logger.info(f"Buscando coordenadas para endereço: {endereco_completo}")
+        
+        nominatim_url = "https://nominatim.openstreetmap.org/search"
+        
+        # Adicionar Brazil ao final se não tiver
+        endereco_busca = endereco_completo
+        if "brazil" not in endereco_completo.lower() and "brasil" not in endereco_completo.lower():
+            endereco_busca = endereco_completo + ", Brazil"
+        
+        params = {
+            'q': endereco_busca,
+            'format': 'json',
+            'limit': 1,
+            'countrycodes': 'br',
+            'addressdetails': 1  # Retorna detalhes do endereço
+        }
+        headers = {
+            'User-Agent': 'LeveSol-Taxa-Deslocamento/1.0 (contato@levesol.com.br)'
+        }
+        
+        response = requests.get(nominatim_url, params=params, headers=headers, timeout=5)
+        
+        if response.status_code != 200 or not response.json():
+            raise Exception(f"Endereço não encontrado: {endereco_completo}")
+        
+        resultado_busca = response.json()[0]
+        address = resultado_busca.get('address', {})
+        
+        # Extrair cidade (pode vir em diferentes campos)
+        cidade = (
+            address.get('city') or 
+            address.get('town') or 
+            address.get('municipality') or 
+            address.get('village') or 
+            address.get('county') or
+            ''
+        )
+        
+        # Extrair UF
+        uf = address.get('state', '')
+        
+        # Extrair CEP se disponível
+        cep = address.get('postcode', 'N/A')
+        
+        resultado = {
+            'lat': float(resultado_busca['lat']),
+            'lon': float(resultado_busca['lon']),
+            'endereco': resultado_busca.get('display_name', endereco_completo),
+            'cidade': cidade,
+            'uf': uf,
+            'cep': cep
+        }
+        
+        # Guardar no cache
+        CACHE_COORDENADAS[cache_key] = resultado
+        
+        logger.info(f"Coordenadas encontradas: {resultado['lat']}, {resultado['lon']}")
+        logger.info(f"Localização identificada: {cidade} - {uf}")
+        return resultado
+        
+    except Exception as e:
+        logger.error(f"Erro ao obter coordenadas por endereço: {e}")
+        raise
+
 def calcular_distancia_osrm(coord_origem: dict, coord_destino: dict) -> dict:
     """
     Calcula distância real de direção usando OSRM (Open Source Routing Machine)
@@ -230,9 +306,89 @@ def calcular_distancia_haversine(coord_origem: dict, coord_destino: dict) -> dic
         'metodo': 'haversine_ajustado'
     }
 
+def calcular_taxa_por_endereco(endereco_destino: str) -> dict:
+    """
+    Calcula taxa de deslocamento usando endereço diretamente
+    """
+    try:
+        logger.info(f"=== Iniciando cálculo de taxa por endereço ===")
+        logger.info(f"Endereço Destino: {endereco_destino}")
+        
+        # Obter coordenadas da origem (Levesol - Bauru)
+        coord_origem = obter_coordenadas_viacep(CEP_ORIGEM)
+        
+        # Obter coordenadas do endereço de destino
+        coord_destino = obter_coordenadas_por_endereco(endereco_destino)
+        
+        # Calcular distância
+        resultado_distancia = calcular_distancia_osrm(coord_origem, coord_destino)
+        
+        distancia_ida_km = resultado_distancia['distancia_metros'] / 1000
+        duracao_minutos = resultado_distancia['duracao_segundos'] / 60
+        
+        # Calcular taxa
+        valor_taxa = 0.0
+        km_excedente = 0.0
+        
+        if distancia_ida_km > FRANQUIA_KM_IDA:
+            distancia_total_km = distancia_ida_km * 2
+            km_excedente = distancia_total_km - FRANQUIA_KM_TOTAL
+            valor_taxa = km_excedente * TAXA_POR_KM
+            logger.info(f"Distância excede franquia. Taxa: R$ {valor_taxa:.2f}")
+        else:
+            logger.info(f"Distância dentro da franquia. Sem taxa adicional.")
+        
+        resultado = {
+            "status": "sucesso",
+            "origem": {
+                "cep": CEP_ORIGEM,
+                "endereco": coord_origem['endereco'],
+                "coordenadas": {
+                    "lat": coord_origem['lat'],
+                    "lon": coord_origem['lon']
+                }
+            },
+            "destino": {
+                "endereco_informado": endereco_destino,
+                "endereco_encontrado": coord_destino['endereco'],
+                "cidade": coord_destino['cidade'],
+                "uf": coord_destino['uf'],
+                "cep": coord_destino['cep'],
+                "coordenadas": {
+                    "lat": coord_destino['lat'],
+                    "lon": coord_destino['lon']
+                }
+            },
+            "distancia": {
+                "ida_km": round(distancia_ida_km, 2),
+                "ida_volta_km": round(distancia_ida_km * 2, 2),
+                "tempo_estimado_ida_minutos": round(duracao_minutos, 0),
+                "metodo_calculo": resultado_distancia['metodo']
+            },
+            "calculo": {
+                "franquia_km_ida": FRANQUIA_KM_IDA,
+                "franquia_km_total": FRANQUIA_KM_TOTAL,
+                "km_excedente": round(km_excedente, 2),
+                "taxa_por_km": TAXA_POR_KM,
+                "valor_taxa": round(valor_taxa, 2)
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        logger.info(f"=== Cálculo concluído com sucesso ===")
+        return resultado
+        
+    except Exception as e:
+        logger.error(f"Erro ao calcular taxa: {e}")
+        return {
+            "status": "erro",
+            "codigo": "ERRO_CALCULO",
+            "mensagem": str(e)
+        }
+
 def calcular_taxa_deslocamento(cep_destino: str) -> dict:
     """
-    Calcula taxa de deslocamento usando APIs gratuitas
+    Calcula taxa de deslocamento usando CEP (mantido para compatibilidade)
     """
     try:
         cep_destino_formatado = formatar_cep(cep_destino)
@@ -315,12 +471,13 @@ def home():
     """Rota raiz com informações da API"""
     return jsonify({
         "api": "Calculadora de Taxa de Deslocamento - LEVESOL",
-        "versao": "1.0.0-free",
+        "versao": "2.0.0-endereco",
         "endpoints": {
             "/": "Informações da API",
             "/health": "Status de saúde",
-            "/calcular": "POST - Calcular taxa de deslocamento",
+            "/calcular": "POST - Calcular taxa de deslocamento (aceita 'endereco' ou 'cep')",
             "/teste/<cep>": "GET - Testar cálculo com CEP",
+            "/teste-endereco/<endereco>": "GET - Testar cálculo com endereço",
             "/limpar-cache": "POST - Limpar cache de coordenadas"
         },
         "servicos_utilizados": {
@@ -335,10 +492,19 @@ def home():
             "taxa_por_km": f"R$ {TAXA_POR_KM}",
             "formula": "(Distância_Total_KM - 60) × R$ 1,60"
         },
+        "exemplo_uso_endereco": {
+            "descricao": "Enviar endereço completo em formato livre",
+            "exemplos": [
+                "Avenida Paulista, 1000, São Paulo, SP",
+                "Rua XV de Novembro, Marília",
+                "Praça da Sé, São Paulo"
+            ]
+        },
         "observacoes": [
+            "NOVIDADE: Agora aceita endereço completo (não precisa mais de CEP!)",
             "Distâncias calculadas por rota rodoviária quando disponível",
             "Fallback para cálculo aproximado se serviço OSRM estiver indisponível",
-            "CEPs são cacheados para melhor performance"
+            "Endereços e CEPs são cacheados para melhor performance"
         ]
     })
 
@@ -359,6 +525,14 @@ def health():
     except:
         status["servicos"]["viacep"] = "inacessível"
     
+    # Testar Nominatim
+    try:
+        r = requests.get("https://nominatim.openstreetmap.org/search?q=São+Paulo&format=json&limit=1", 
+                        headers={'User-Agent': 'LeveSol-Taxa-Deslocamento/1.0'}, timeout=2)
+        status["servicos"]["nominatim"] = "operacional" if r.status_code == 200 else "com problema"
+    except:
+        status["servicos"]["nominatim"] = "inacessível"
+    
     # Testar OSRM
     try:
         r = requests.get("http://router.project-osrm.org/route/v1/driving/-49.0708,-22.3155;-46.6388,-23.5489?overview=false", timeout=2)
@@ -373,7 +547,12 @@ def calcular():
     """
     Endpoint principal para calcular taxa de deslocamento
     
-    Body JSON esperado:
+    Body JSON - Opção 1 (RECOMENDADO - Endereço completo):
+    {
+        "endereco": "Avenida Paulista, 1000, São Paulo, SP"
+    }
+    
+    Body JSON - Opção 2 (Compatibilidade - CEP):
     {
         "cep": "17500-005"
     }
@@ -381,25 +560,55 @@ def calcular():
     try:
         data = request.get_json()
         
-        if not data or 'cep' not in data:
+        if not data:
             return jsonify({
                 "status": "erro",
-                "codigo": "CEP_OBRIGATORIO",
-                "mensagem": "CEP é obrigatório no corpo da requisição"
+                "codigo": "DADOS_OBRIGATORIOS",
+                "mensagem": "Informe o endereço ou CEP no corpo da requisição",
+                "exemplo_endereco": {
+                    "endereco": "Avenida Paulista, 1000, São Paulo, SP"
+                },
+                "exemplo_cep": {
+                    "cep": "17500-005"
+                }
             }), 400
         
-        cep = data['cep']
-        cep_limpo = limpar_cep(cep)
-        
-        if len(cep_limpo) != 8:
+        # Verificar se foi enviado endereço ou CEP
+        if 'endereco' in data:
+            endereco = data['endereco'].strip()
+            
+            if not endereco:
+                return jsonify({
+                    "status": "erro",
+                    "codigo": "ENDERECO_VAZIO",
+                    "mensagem": "O endereço não pode estar vazio"
+                }), 400
+            
+            # Calcular usando endereço
+            resultado = calcular_taxa_por_endereco(endereco)
+            
+        elif 'cep' in data:
+            # Manter compatibilidade com CEP
+            cep = data['cep']
+            cep_limpo = limpar_cep(cep)
+            
+            if len(cep_limpo) != 8:
+                return jsonify({
+                    "status": "erro",
+                    "codigo": "CEP_INVALIDO",
+                    "mensagem": f"CEP inválido: {cep}. Use formato XXXXX-XXX ou XXXXXXXX"
+                }), 400
+            
+            resultado = calcular_taxa_deslocamento(cep)
+        else:
             return jsonify({
                 "status": "erro",
-                "codigo": "CEP_INVALIDO",
-                "mensagem": f"CEP inválido: {cep}. Use formato XXXXX-XXX ou XXXXXXXX"
+                "codigo": "PARAMETRO_INVALIDO",
+                "mensagem": "Informe 'endereco' ou 'cep' no corpo da requisição",
+                "exemplo": {
+                    "endereco": "Rua XV de Novembro, Marília, SP"
+                }
             }), 400
-        
-        # Calcular taxa
-        resultado = calcular_taxa_deslocamento(cep)
         
         # Retornar com status HTTP apropriado
         if resultado['status'] == 'erro':
@@ -418,10 +627,25 @@ def calcular():
 @app.route('/teste/<cep>')
 def teste(cep):
     """
-    Endpoint GET para testes rápidos
+    Endpoint GET para testes rápidos com CEP
     Exemplo: /teste/17500-005
     """
     resultado = calcular_taxa_deslocamento(cep)
+    
+    if resultado['status'] == 'erro':
+        return jsonify(resultado), 400
+    
+    return jsonify(resultado), 200
+
+@app.route('/teste-endereco/<path:endereco>')
+def teste_endereco(endereco):
+    """
+    Endpoint GET para testes rápidos com endereço
+    Exemplos: 
+    - /teste-endereco/Avenida Paulista, São Paulo
+    - /teste-endereco/Rua XV de Novembro, 123, Marília, SP
+    """
+    resultado = calcular_taxa_por_endereco(endereco)
     
     if resultado['status'] == 'erro':
         return jsonify(resultado), 400
@@ -460,4 +684,5 @@ def internal_error(error):
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 7777))
     logger.info(f"Iniciando servidor na porta {port}")
+    logger.info(f"Versão 2.0 - Suporte a cálculo por ENDEREÇO!")
     app.run(host='0.0.0.0', port=port, debug=False)
