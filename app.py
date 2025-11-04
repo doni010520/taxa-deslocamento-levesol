@@ -165,7 +165,7 @@ def obter_coordenadas_viacep(cep: str) -> dict:
 def obter_coordenadas_por_endereco(endereco_completo: str) -> dict:
     """
     Obtém coordenadas diretamente do endereço usando Nominatim
-    Aceita endereço em formato livre
+    Aceita endereço em formato livre com fallbacks progressivos
     """
     # Verificar cache (usando endereço como chave)
     cache_key = f"endereco_{endereco_completo.lower().strip()}"
@@ -173,70 +173,118 @@ def obter_coordenadas_por_endereco(endereco_completo: str) -> dict:
         logger.info(f"Endereço '{endereco_completo}' encontrado no cache")
         return CACHE_COORDENADAS[cache_key]
     
-    try:
-        logger.info(f"Buscando coordenadas para endereço: {endereco_completo}")
-        
-        nominatim_url = "https://nominatim.openstreetmap.org/search"
-        
-        # Adicionar Brazil ao final se não tiver
-        endereco_busca = endereco_completo
-        if "brazil" not in endereco_completo.lower() and "brasil" not in endereco_completo.lower():
-            endereco_busca = endereco_completo + ", Brazil"
-        
-        params = {
-            'q': endereco_busca,
-            'format': 'json',
-            'limit': 1,
-            'countrycodes': 'br',
-            'addressdetails': 1  # Retorna detalhes do endereço
-        }
-        headers = {
-            'User-Agent': 'LeveSol-Taxa-Deslocamento/1.0 (contato@levesol.com.br)'
-        }
-        
-        response = requests.get(nominatim_url, params=params, headers=headers, timeout=5)
-        
-        if response.status_code != 200 or not response.json():
-            raise Exception(f"Endereço não encontrado: {endereco_completo}")
-        
-        resultado_busca = response.json()[0]
-        address = resultado_busca.get('address', {})
-        
-        # Extrair cidade (pode vir em diferentes campos)
-        cidade = (
-            address.get('city') or 
-            address.get('town') or 
-            address.get('municipality') or 
-            address.get('village') or 
-            address.get('county') or
-            ''
-        )
-        
-        # Extrair UF
-        uf = address.get('state', '')
-        
-        # Extrair CEP se disponível
-        cep = address.get('postcode', 'N/A')
-        
-        resultado = {
-            'lat': float(resultado_busca['lat']),
-            'lon': float(resultado_busca['lon']),
-            'endereco': resultado_busca.get('display_name', endereco_completo),
-            'cidade': cidade,
-            'uf': uf,
-            'cep': cep
-        }
-        
-        # Guardar no cache
-        CACHE_COORDENADAS[cache_key] = resultado
-        
-        logger.info(f"Coordenadas encontradas: {resultado['lat']}, {resultado['lon']}")
-        logger.info(f"Localização identificada: {cidade} - {uf}")
-        return resultado
-        
-    except Exception as e:
-        logger.error(f"Erro ao obter coordenadas por endereço: {e}")
-        raise
+    nominatim_url = "https://nominatim.openstreetmap.org/search"
+    headers = {
+        'User-Agent': 'LeveSol-Taxa-Deslocamento/1.0 (contato@levesol.com.br)'
+    }
+    
+    # Extrair partes do endereço para fallbacks
+    partes = [p.strip() for p in endereco_completo.split(',')]
+    
+    # Tentar múltiplas estratégias de busca (do mais específico para o mais geral)
+    estrategias = []
+    
+    # Estratégia 1: Endereço completo original
+    estrategias.append({
+        'nome': 'Endereço completo',
+        'busca': endereco_completo + ", Brazil"
+    })
+    
+    # Estratégia 2: Sem o número (se tiver vírgulas)
+    if len(partes) >= 2:
+        # Remove possível número da primeira parte
+        rua_sem_numero = partes[0].rsplit(' ', 1)[0] if ' ' in partes[0] else partes[0]
+        estrategias.append({
+            'nome': 'Rua + Cidade (sem número)',
+            'busca': ', '.join([rua_sem_numero] + partes[1:]) + ", Brazil"
+        })
+    
+    # Estratégia 3: Só últimas 2 partes (geralmente cidade e estado)
+    if len(partes) >= 2:
+        estrategias.append({
+            'nome': 'Cidade + Estado',
+            'busca': ', '.join(partes[-2:]) + ", Brazil"
+        })
+    
+    # Estratégia 4: Só última parte (geralmente estado ou cidade/estado)
+    if len(partes) >= 1:
+        estrategias.append({
+            'nome': 'Último termo',
+            'busca': partes[-1] + ", Brazil"
+        })
+    
+    # Estratégia 5: Tentar extrair cidade e estado de forma inteligente
+    # Procurar por padrões como "Cidade/UF" ou "Cidade, UF"
+    for parte in partes:
+        if '/' in parte or any(uf in parte.upper() for uf in ['SP', 'RJ', 'MG', 'PR', 'SC', 'RS']):
+            estrategias.append({
+                'nome': 'Padrão Cidade/Estado detectado',
+                'busca': parte + ", Brazil"
+            })
+            break
+    
+    # Tentar cada estratégia
+    for idx, estrategia in enumerate(estrategias):
+        try:
+            logger.info(f"Tentativa {idx + 1}/{len(estrategias)}: {estrategia['nome']}")
+            logger.info(f"Buscando: {estrategia['busca']}")
+            
+            params = {
+                'q': estrategia['busca'],
+                'format': 'json',
+                'limit': 1,
+                'countrycodes': 'br',
+                'addressdetails': 1
+            }
+            
+            response = requests.get(nominatim_url, params=params, headers=headers, timeout=5)
+            
+            if response.status_code == 200 and response.json():
+                resultado_busca = response.json()[0]
+                address = resultado_busca.get('address', {})
+                
+                # Extrair cidade
+                cidade = (
+                    address.get('city') or 
+                    address.get('town') or 
+                    address.get('municipality') or 
+                    address.get('village') or 
+                    address.get('county') or
+                    ''
+                )
+                
+                # Extrair UF
+                uf = address.get('state', '')
+                
+                # Extrair CEP se disponível
+                cep = address.get('postcode', 'N/A')
+                
+                resultado = {
+                    'lat': float(resultado_busca['lat']),
+                    'lon': float(resultado_busca['lon']),
+                    'endereco': resultado_busca.get('display_name', endereco_completo),
+                    'cidade': cidade,
+                    'uf': uf,
+                    'cep': cep,
+                    'metodo_busca': estrategia['nome']
+                }
+                
+                # Guardar no cache
+                CACHE_COORDENADAS[cache_key] = resultado
+                
+                logger.info(f"✅ Sucesso com: {estrategia['nome']}")
+                logger.info(f"Coordenadas: {resultado['lat']}, {resultado['lon']}")
+                logger.info(f"Localização: {cidade} - {uf}")
+                
+                return resultado
+            
+        except Exception as e:
+            logger.warning(f"Falha na tentativa {idx + 1}: {e}")
+            continue
+    
+    # Se todas as estratégias falharem, lançar erro
+    logger.error(f"❌ Todas as {len(estrategias)} tentativas falharam para: {endereco_completo}")
+    raise Exception(f"Não foi possível encontrar coordenadas para o endereço: {endereco_completo}")
 
 def calcular_distancia_osrm(coord_origem: dict, coord_destino: dict) -> dict:
     """
@@ -354,6 +402,7 @@ def calcular_taxa_por_endereco(endereco_destino: str) -> dict:
                 "cidade": coord_destino['cidade'],
                 "uf": coord_destino['uf'],
                 "cep": coord_destino['cep'],
+                "metodo_busca": coord_destino.get('metodo_busca', 'Busca direta'),
                 "coordenadas": {
                     "lat": coord_destino['lat'],
                     "lon": coord_destino['lon']
